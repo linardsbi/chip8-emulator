@@ -1,67 +1,13 @@
-#include <SDL.h>
-#include <SDL_keycode.h>
-#include <SDL_mixer.h>
-#include <SDL_render.h>
-#include <SDL_timer.h>
-#include <SDL_video.h>
 #include <chrono>
 #include <format>
 #include <iostream>
+#include <memory>
 #include <string_view>
 
 #include "CHIP8.hpp"
+#include "UI.hpp"
 #include "config.hpp"
-
-auto init_sdl(std::string_view window_name, auto width, auto height) {
-  auto audio_rate = 44100;
-  auto audio_format = static_cast<uint16_t>(AUDIO_S32);
-  auto audio_channels = 1;
-
-  if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER | SDL_INIT_AUDIO) < 0) {
-    SDL_Log("Couldn't initialize SDL: %s\n", SDL_GetError());
-    exit(1);
-  }
-
-  if (Mix_OpenAudio(audio_rate, audio_format, audio_channels, 4096) < 0) {
-    SDL_Log("Couldn't open audio: %s\n", SDL_GetError());
-    exit(1);
-  } else {
-    Mix_QuerySpec(&audio_rate, &audio_format, &audio_channels);
-    SDL_Log("Opened audio at %d Hz %d bit%s %s", audio_rate,
-            (audio_format & 0xFF),
-            (SDL_AUDIO_ISFLOAT(audio_format) ? " (float)" : ""),
-            (audio_channels > 2)   ? "surround"
-            : (audio_channels > 1) ? "stereo"
-                                   : "mono");
-  }
-
-  auto *window = SDL_CreateWindow(window_name.data(), SDL_WINDOWPOS_UNDEFINED,
-                                  SDL_WINDOWPOS_UNDEFINED, width, height,
-                                  SDL_WINDOW_SHOWN);
-
-  // full rgb because why not
-  constexpr auto bpp = 32;
-  auto *chip8_screen = SDL_CreateRGBSurface(0, Emulator::WIDTH,
-                                            Emulator::HEIGHT, bpp, 0, 0, 0, 0);
-
-  auto *renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
-  SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
-
-  SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "best");
-  SDL_RenderSetLogicalSize(renderer, width, height);
-
-  std::string_view filename = "beep.wav";
-  auto *beep = Mix_LoadWAV(filename.data());
-
-  if (beep == nullptr) {
-    SDL_Log("Couldn't load %s: %s\n", filename.data(), SDL_GetError());
-    exit(1);
-  }
-
-  return std::tuple(window, renderer, chip8_screen, beep);
-}
-
-enum class Key { None, Exit, Pause };
+#include "SDL_defines.hpp"
 
 // handles input for both the emulator and window events
 static Key handle_input(auto &emulator, auto &instruction_timer) {
@@ -153,26 +99,24 @@ static Key handle_input(auto &emulator, auto &instruction_timer) {
   return Key::None;
 }
 
-static void render_frame(auto *window, auto *surface, auto *renderer,
-                         auto &emulator) {
-  SDL_RenderClear(renderer);
+static void render_frame(auto &context, auto &emulator, auto& user_interface) {
+  SDL_SetRenderDrawColor(context.renderer, 0, 0, 0, 255);
+  SDL_RenderClear(context.renderer);
 
-  auto *window_surface = SDL_GetWindowSurface(window);
+  int pitch;
+  SDL_LockTexture(context.chip8_screen, NULL, (void **)&context.pixels, &pitch);
 
-  SDL_FillRect(surface, nullptr, SDL_MapRGBA(surface->format, 0, 0, 0, 255));
-
-  auto *pixels = static_cast<uint32_t *>(surface->pixels);
-  const auto color = SDL_MapRGBA(surface->format, 255, 255, 255, 255);
-
+  const auto color = SDL_MapRGBA(context.pixel_format, 255, 255, 255, 255);
+  
   if (!emulator.need_clear_screen()) {
-    SDL_LockSurface(surface);
+    SDL_UnlockTexture(context.chip8_screen);
     for (int y = 0; y < Emulator::HEIGHT; ++y) {
       for (int x = 0; x < Emulator::WIDTH; ++x) {
-        const auto coordinate = y * surface->w + x;
-        pixels[coordinate] = emulator.get_pixel(coordinate) > 0 ? color : 0;
+        const auto coordinate = y * Emulator::WIDTH + x;
+        context.pixels[coordinate] = emulator.get_pixel(coordinate) > 0 ? color : 0;
       }
     }
-    SDL_UnlockSurface(surface);
+    SDL_UnlockTexture(context.chip8_screen);
   }
 
   emulator.set_need_clear_screen(false);
@@ -184,9 +128,15 @@ static void render_frame(auto *window, auto *surface, auto *renderer,
                           .w = WINDOW_WIDTH,
                           .h = target_height};
 
-  SDL_BlitScaled(surface, nullptr, window_surface, &window_rect);
+  if (SDL_RenderCopy(context.renderer, context.chip8_screen, nullptr,
+                     &window_rect) < 0) {
+    SDL_Log("Couldn't load %s\n", SDL_GetError());
+    exit(1);
+  }
 
-  SDL_UpdateWindowSurface(window);
+  user_interface.render(context);
+
+  SDL_RenderPresent(context.renderer);
 }
 
 struct Timer {
@@ -220,10 +170,9 @@ auto init_timers() {
 int main() {
   std::string_view game_name = "particles.ch8";
 
-  auto [window, renderer, chip8_screen, beep] =
-      init_sdl(game_name, WINDOW_WIDTH, WINDOW_HEIGHT);
-
+  Context context(game_name, WINDOW_WIDTH, WINDOW_HEIGHT);
   Emulator::CHIP8 emulator;
+  UI user_interface;
 
   if (!emulator.load_rom(game_name)) {
     std::cout << std::format("Could not open ROM: {}\n", game_name);
@@ -235,8 +184,8 @@ int main() {
   auto [frame_timer, timer_timer, instruction_timer] = init_timers();
 
   bool paused = false;
-  for (Key key{}; key != Key::Exit;) {
 
+  for (Key key{}; key != Key::Exit;) {
     key = handle_input(emulator, instruction_timer);
 
     if (key == Key::Pause) {
@@ -246,13 +195,22 @@ int main() {
     const auto now = std::chrono::system_clock::now();
 
     if (frame_timer.exec(now)) {
-      render_frame(window, chip8_screen, renderer, emulator);
+      if (user_interface.container_start()) {
+        // user_interface.textbox("Tab 1");
+        // user_interface.textbox("Tab 2");
+        // user_interface.textbox("Tab 3");
+        // user_interface.button("Click me");
+
+        user_interface.container_end();
+      }
+      
+      render_frame(context, emulator, user_interface);
     }
 
     if (!paused) {
       if (timer_timer.exec(now)) {
         if (emulator.sound_playing()) {
-          Mix_PlayChannel(0, beep, 0);
+          Mix_PlayChannel(0, context.beep, 0);
         } else {
           Mix_HaltChannel(0);
         }
@@ -269,10 +227,6 @@ int main() {
     }
   }
 
-  SDL_DestroyRenderer(renderer);
-  SDL_DestroyWindowSurface(window);
-  SDL_DestroyWindow(window);
-  Mix_FreeChunk(beep);
   Mix_CloseAudio();
   SDL_Quit();
 
